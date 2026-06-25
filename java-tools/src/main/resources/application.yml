@@ -1,0 +1,14 @@
+server:
+  port: 9090
+spring:
+  application:
+    name: ai-study-java-tools
+  jackson:
+    default-property-inclusion: non_null
+logging:
+  level:
+    com.ustccb.aistudy: INFO
+chunking:
+  defaultChunkSize: 500
+  defaultOverlap: 80
+  maxChunkSize: 2000
