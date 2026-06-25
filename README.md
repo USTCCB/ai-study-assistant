@@ -1,70 +1,154 @@
 # ai-study-assistant
 
-个人学习问答助手 —— **前端 FastAPI + Python，文档切片/批处理用 Java**。
+个人学习问答助手 —— 用户上传文档（.txt / .md），系统对文档做切片、
+向量化、入 pgvector；用户提问时按余弦相似度取 Top-K，把候选片段
+和原问题一起交给 LLM 生成答案，并在每条答案里带"来源 N + 相似度"。
 
-- Python：FastAPI 0.111 + LangChain + pgvector + OpenAI/Claude API
-- Java 工具：Spring Boot 3.2 + Java 17（java-tools/），负责文档滑动窗口切片、对内提供 /api/chunk HTTP 服务
-- 数据：PostgreSQL + pgvector
-- 工具：Docker / Docker Compose / GitHub Actions
+## 技术栈
+
+- Python 3.11
+- Web：FastAPI 0.111（接口 + 自动 OpenAPI 文档 `/docs`）
+- LLM / Embedding：OpenAI 兼容接口（`openai` SDK 1.x；`OPENAI_BASE_URL`
+  可指向 DeepSeek / 其它兼容服务）
+- RAG：pgvector（PostgreSQL 16 向量扩展）
+- ORM：SQLAlchemy 2.0
+- 测试：pytest
+- 工程化：Docker / Docker Compose / GitHub Actions
 
 ## 目录结构
 
-`
+```
 .
-├── app/                Python FastAPI 主服务（接口、检索、生成、Embedding）
-├── scripts/            离线脚本（ingest、QA demo）
-├── data/               示例文档
-├── tests/              Python 单测
-├── java-tools/         Java 子项目：离线文档切片 HTTP 服务
-│   ├── pom.xml
-│   ├── Dockerfile
-│   ├── examples/call_java_chunk.py  Python 调用 Java 的样例
-│   └── src/main/java/com/ustccb/aistudy
-│       ├── AiStudyJavaToolsApplication.java
-│       ├── controller/ChunkController.java
-│       ├── service/ChunkService.java
-│       ├── dto/ChunkRequest/ChunkResponse/Chunk/ApiResponse
-│       └── src/test/...   JUnit5 单元测试
-└── .github/workflows/
-    ├── python-ci.yml
-    └── java-tools-ci.yml
-`
++-- app/
+|   +-- main.py                FastAPI 入口，挂载 documents / qa / agent 三个 router
+|   +-- api/
+|   |   +-- documents.py       文档上传/文本入库
+|   |   +-- qa.py              问答接口
+|   |   +-- agent.py           Function Calling Agent 入口
+|   +-- core/
+|   |   +-- config.py          pydantic-settings 读 .env
+|   |   +-- db.py              SQLAlchemy engine + Session
+|   |   +-- models.py          Document / Chunk ORM
+|   +-- services/
+|       +-- splitter.py        文本切片
+|       +-- embedder.py        Embedding 批调用
+|       +-- retriever.py       pgvector 余弦相似度 Top-K
+|       +-- generator.py       RAG 生成（拼 prompt + 调 LLM）
+|       +-- agent.py           Function Calling Agent
++-- tests/
+|   +-- test_agent.py          Agent 单测
++-- requirements.txt
++-- Dockerfile
++-- docker-compose.yml         一键起 pgvector + FastAPI
++-- .github/workflows/
+    +-- python-ci.yml
+```
 
-## Java 工具：为什么 + 怎么用
+## 数据流
 
-Python 端做切片太慢，Java 用 String.substring 切大文本更快，且**和主项目解耦**（独立 java-tools/ Spring Boot 子项目）。
-
-`ash
-cd java-tools
-mvn spring-boot:run            # 启动 :9090
-
-# 另一个终端：Python 调 Java
-python examples/call_java_chunk.py ../data/sample.md
-`
-
-接口：
-
-| Method | Path           | 说明 |
-|--------|----------------|------|
-| POST   | /api/chunk     | 文本 → chunk 列表（滑动窗口，句子边界优先） |
-| GET    | /api/health    | 健康检查 |
-| GET    | /actuator/health | actuator |
-
-请求体：
-
-`json
-{ "text": "一大段文本...", "chunkSize": 500, "overlap": 80, "source": "data/sample.md" }
-`
+```
+        +--------------------+
+        |  上传 .txt / .md   |
+        +---------+----------+
+                  |
+                  v
+        +--------------------+        +-------------------+
+        |  splitter 切块      |  -->   |  embedder 批向量化 |
+        +--------------------+        +---------+---------+
+                                                  |
+                                                  v
+                                        +-------------------+
+                                        |  pgvector 批量入库 |
+                                        |  unnest(:contents,|
+                                        |       :vectors,  |
+                                        |       :idxs)      |
+                                        +-------------------+
+                                                  ^
+                                                  |
+        +--------------------+        +-----------+-----------+
+        |  提问               |  -->   |  retriever Top-K     |
+        +--------------------+        |  1 - (emb <=> :qvec) |
+                  |                   +-----------+-----------+
+                  |                               |
+                  v                               v
+                +---------------------------------------+
+                |  generator：拼 prompt + 调 LLM        |
+                |  答案中带 [来源 N] 和相似度            |
+                +---------------------------------------+
+```
 
 ## 本地启动
 
-`ash
+```bash
 docker compose up -d
-# Python: http://localhost:8000  /docs
-# Java  : http://localhost:9090  /actuator/health
-`
+# FastAPI:  http://localhost:8000  /docs
+# pgvector: localhost:5432
+```
 
-## CI
+`.env` 至少需要：
 
-- python-ci.yml：Python 单测
-- java-tools-ci.yml：Java 端 mvn clean verify + 上传 jar
+```
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+EMBEDDING_MODEL=text-embedding-3-small
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/ai_study
+```
+
+## 主要接口
+
+| Method | Path | 说明 |
+|---|---|---|
+| POST | /api/documents/text | 文本入库（title + content） |
+| POST | /api/documents/file | 文件入库（.txt / .md） |
+| POST | /api/qa/ask | 问答，返回 `answer` + 引用片段 |
+| POST | /api/agent/run | Function Calling Agent 入口 |
+
+## 关键代码片段
+
+### 1. pgvector 批量入库（`app/api/documents.py`）
+
+```python
+sql = text("""
+    INSERT INTO chunks (document_id, content, embedding, chunk_index)
+    SELECT :doc_id, content, vec, idx
+    FROM unnest(:contents::text[], :vectors::vector[], :idxs::int[])
+    AS t(content, vec, idx)
+""")
+db.execute(sql, {
+    "doc_id": str(doc_id),
+    "contents": chunks,
+    "vectors": [str(v) for v in vectors],
+    "idxs": list(range(len(chunks))),
+})
+```
+
+### 2. 余弦相似度 Top-K（`app/services/retriever.py`）
+
+```python
+sql = text("""
+    SELECT c.content, c.document_id,
+           1 - (c.embedding <=> :qvec) AS similarity
+    FROM chunks c
+    ORDER BY c.embedding <=> :qvec
+    LIMIT :k
+""")
+```
+
+`1 - (embedding <=> :qvec)` 把 pgvector 的 cosine **距离**转成 **相似度**。
+返回 `(content, similarity, document_id)`。
+
+### 3. Function Calling Agent
+
+Function Calling Agent 已经抽到独立仓库
+[`USTCCB/function-calling-agent`](https://github.com/USTCCB/function-calling-agent)，
+便于单独 review 工具分发 / 主循环 / 异常兜底。本仓库保留 `app/services/agent.py`
+作为入口，挂载在 `/api/agent/run`。
+
+## 测试
+
+```bash
+pytest -q
+```
+
+CI 在 push / PR 时自动跑（见 `.github/workflows/python-ci.yml`）。
