@@ -4,7 +4,7 @@ AI 智能学习助手 - RAG 知识库
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import documents, qa
+from app.api import documents, qa, agent
 from app.core.config import settings
 
 
@@ -33,6 +33,7 @@ app.add_middleware(
 
 app.include_router(documents.router, prefix="/api/documents", tags=["文档"])
 app.include_router(qa.router, prefix="/api/qa", tags=["问答"])
+app.include_router(agent.router, prefix="/api/agent", tags="Agent")
 
 
 @app.get("/")
@@ -43,3 +44,4 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
